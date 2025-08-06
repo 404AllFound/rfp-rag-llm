@@ -1,42 +1,32 @@
 import os
 import re
 import time
-import openai
+import json
+import hashlib
+import faiss
+import numpy as np
+import nltk
+import tiktoken
 from pathlib import Path
 from dotenv import load_dotenv
 from tqdm import tqdm
-import json
-
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnablePassthrough, RunnableMap
-from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_core.runnables import RunnablePassthrough
 from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.chat_models import ChatOpenAI
-from llama_index.readers.file import HWPReader
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-# 환경 변수 로드
-def find_and_load_dotenv(start_path: Path = Path(__file__).resolve(), filename=".env"):
-    current = start_path.parent
-    while current != current.parent:
-        env_path = current / filename
-        if env_path.exists():
-            load_dotenv(dotenv_path=env_path)
-            print(f".env loaded from: {env_path}")
-            return True
-        current = current.parent
-    print(".env 파일을 찾지 못했습니다.")
-    return False
+nltk.download('punkt')
+load_dotenv()
 
-find_and_load_dotenv()
 
-# 문장 분리 함수
 def split_sentences(text):
     return re.split(r'(?<=[.!?])\s+', text.strip())
 
-# 문서 로딩 함수 (확장된 메타데이터 반영하여여 수정)
+
 def load_documents(folder_path, limit_files=None):
     all_docs = []
     files = sorted([f for f in os.listdir(folder_path) if f.endswith(".json")])
@@ -75,139 +65,248 @@ def load_documents(folder_path, limit_files=None):
     return all_docs
 
 
-# 청킹 함수 (json에 - 숫자 - 형식이 많았기에 그에 맞게 수정
-def semantic_chunk_documents(documents, max_chunk_len=300, overlap_len=0):
+def semantic_token_chunk_documents(documents, max_tokens=300, overlap_tokens=50, model_name="text-embedding-3-small"):
+    enc = tiktoken.encoding_for_model(model_name)
     chunked_docs = []
-    for doc in tqdm(documents, desc="Chunking documents"):
+
+    for doc in tqdm(documents, desc="Token-based Chunking"):
         text = doc.text if hasattr(doc, "text") else doc.page_content
         metadata = doc.metadata
-        sentences = re.split(r'(?<=[\.\?])\s+', text.strip())
-
-        buffer = ""
-        last_sentences = []
+        sentences = nltk.sent_tokenize(text)
+        buffer = []
+        buffer_token_count = 0
 
         for sentence in sentences:
-            if not sentence.strip():
-                continue
+            sentence_tokens = enc.encode(sentence)
+            sentence_len = len(sentence_tokens)
 
-            # 실제로 유효한 유일한 기준
-            if re.match(r"^- \d+ -", sentence):
-                if buffer.strip():
-                    chunked_docs.append(Document(page_content=buffer.strip(), metadata=metadata))
-                buffer = sentence + " "
-                last_sentences = [sentence]
-                continue
-
-            if len(buffer) + len(sentence) <= max_chunk_len:
-                buffer += sentence + " "
-                last_sentences.append(sentence)
+            if buffer_token_count + sentence_len <= max_tokens:
+                buffer.append(sentence)
+                buffer_token_count += sentence_len
             else:
-                chunked_docs.append(Document(page_content=buffer.strip(), metadata=metadata))
-                buffer = " ".join(last_sentences[-overlap_len:]) + " " + sentence + " " if overlap_len > 0 else sentence + " "
-                last_sentences = last_sentences[-overlap_len:] + [sentence]
+                chunked_docs.append(Document(page_content=" ".join(buffer), metadata=metadata))
+                if overlap_tokens > 0:
+                    overlap_text = " ".join(buffer)[-overlap_tokens:]
+                    overlap_tokens_list = enc.encode(overlap_text)
+                    buffer = [enc.decode(overlap_tokens_list)] + [sentence]
+                    buffer_token_count = len(enc.encode(" ".join(buffer)))
+                else:
+                    buffer = [sentence]
+                    buffer_token_count = sentence_len
 
-        if buffer.strip():
-            chunked_docs.append(Document(page_content=buffer.strip(), metadata=metadata))
+        if buffer:
+            chunked_docs.append(Document(page_content=" ".join(buffer), metadata=metadata))
+
     return chunked_docs
 
-# FAISS 인덱스 빌드 (문장 단위가 아닌 전체 글단위로 수정)
+
 def build_faiss_index(docs, embedding, batch_size=50):
+    def hash_text(text):
+        return hashlib.md5(text.encode("utf-8")).hexdigest()
 
-    # 중복 제거
-    unique_pairs = {}
-    for doc in docs:
-        key = doc.page_content.strip()
-        if key not in unique_pairs:
-            unique_pairs[key] = doc.metadata
+    def embed_with_retry(embedder, texts, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                return embedder.embed_documents(texts)
+            except Exception as e:
+                print(f"[Retry {attempt+1}] Embedding failed: {e}")
+                time.sleep(2 ** attempt)
+        raise RuntimeError("Embedding failed after multiple retries")
 
+    enc = tiktoken.encoding_for_model("text-embedding-3-large")
+    cache_file = "embedding_cache.json"
+    cache = json.load(open(cache_file, "r", encoding="utf-8")) if os.path.exists(cache_file) else {}
+
+    unique_pairs = {doc.page_content.strip(): doc.metadata for doc in docs}
     texts = list(unique_pairs.keys())
     metadatas = list(unique_pairs.values())
-
-    # 너무 짧은 텍스트 필터링
-    filtered = [(t, m) for t, m in zip(texts, metadatas) if len(t) > 20]
+    filtered = [(t, m) for t, m in zip(texts, metadatas) if len(enc.encode(t)) > 5]
     texts, metadatas = zip(*filtered) if filtered else ([], [])
 
-    # 임베딩 수행
     embeddings = []
-    print("\nEmbedding in batches...")
+    new_cache_entries = {}
+
+    print("\nEmbedding in batches with caching & token safety...")
     for i in tqdm(range(0, len(texts), batch_size)):
-        batch = texts[i:i+batch_size]
-        embs = embedding.embed_documents(batch)
-        embeddings.extend(embs)
+        batch = texts[i:i + batch_size]
+        batch_to_embed, cache_hits = [], []
+
+        for text in batch:
+            h = hash_text(text)
+            if h in cache:
+                embeddings.append(cache[h])
+            else:
+                batch_to_embed.append(text)
+                cache_hits.append(h)
+
+        if batch_to_embed:
+            total_tokens = sum(len(enc.encode(t)) for t in batch_to_embed)
+            if total_tokens > 280_000:
+                mid = len(batch_to_embed) // 2
+                embs = embed_with_retry(embedding, batch_to_embed[:mid]) + embed_with_retry(embedding, batch_to_embed[mid:])
+            else:
+                embs = embed_with_retry(embedding, batch_to_embed)
+
+            for h, emb in zip(cache_hits, embs):
+                cache[h] = emb
+                new_cache_entries[h] = emb
+            embeddings.extend(embs)
+
+    if new_cache_entries:
+        json.dump(cache, open(cache_file, "w", encoding="utf-8"))
 
     print(f"Total chunks: {len(texts)} | Total embeddings: {len(embeddings)}")
+    dim = len(embeddings[0])
+    index = faiss.IndexFlatL2(dim)
+    if faiss.get_num_gpus() > 0:
+        print("Using FAISS GPU acceleration...")
+        index = faiss.index_cpu_to_all_gpus(index)
+    index.add(np.array(embeddings).astype("float32"))
 
-    return FAISS.from_embeddings(
-        text_embeddings=list(zip(texts, embeddings)),
-        embedding=embedding,
-        metadatas=metadatas
-    )
+    return FAISS(embedding=embedding, index=index, documents=[
+        Document(page_content=t, metadata=m) for t, m in zip(texts, metadatas)
+    ])
 
-    
-# 리트리버 생성
-def get_retriever(documents_path, index_path="/home/data/B_faiss_db/", reuse_index=True, k=5, limit_files=None):
+
+def get_retriever(documents_path, index_path="./data/B_faiss_db/", reuse_index=True, k=5, limit_files=None):
     start_time = time.time()
 
     documents = load_documents(documents_path, limit_files=limit_files)
-    chunks = semantic_chunk_documents(documents, max_chunk_len=300, overlap_len=1)  
+    if not documents:
+        raise ValueError("No documents found.")
+
+    chunks = semantic_token_chunk_documents(documents, max_tokens=300, overlap_tokens=50, model_name="text-embedding-3-small")
+    if not chunks:
+        raise ValueError("No chunks created.")
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY is not set.")
+
     embedding = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=api_key)
+    enc = tiktoken.encoding_for_model("text-embedding-3-small")
+
+    cache_file = "embedding_cache.json"
+    cache = json.load(open(cache_file, "r", encoding="utf-8")) if os.path.exists(cache_file) else {}
 
     if reuse_index and os.path.exists(index_path):
         print("Loading existing FAISS index...")
-        vector_db = FAISS.load_local(index_path, embedding, allow_dangerous_deserialization=True)
+        faiss_db = FAISS.load_local(index_path, embedding, allow_dangerous_deserialization=True)
     else:
-        vector_db = build_faiss_index(chunks, embedding)
-        vector_db.save_local(index_path)
+        unique_pairs = {doc.page_content.strip(): doc.metadata for doc in chunks}
+        texts = list(unique_pairs.keys())
+        metadatas = list(unique_pairs.values())
+        if not texts:
+            raise ValueError("No texts for embedding.")
 
-    retriever = vector_db.as_retriever(
-        search_type="similarity",  
-        search_kwargs={"k": k}
+        filtered = [(t, m) for t, m in zip(texts, metadatas) if len(enc.encode(t)) > 2]
+        texts, metadatas = zip(*filtered) if filtered else ([], [])
+        if not texts:
+            raise ValueError("All texts filtered out.")
+
+        embeddings, new_cache_entries = [], {}
+        print("\nEmbedding in batches with caching & token safety...")
+        for i in tqdm(range(0, len(texts), 100)):
+            batch = texts[i:i + 100]
+            batch_to_embed, cache_hits = [], []
+
+            for text in batch:
+                h = hashlib.md5(text.encode("utf-8")).hexdigest()
+                if h in cache:
+                    embeddings.append(cache[h])
+                else:
+                    batch_to_embed.append(text)
+                    cache_hits.append(h)
+
+            if batch_to_embed:
+                total_tokens = sum(len(enc.encode(t)) for t in batch_to_embed)
+                if total_tokens > 280_000:
+                    mid = len(batch_to_embed) // 2
+                    embs = embedding.embed_documents(batch_to_embed[:mid]) + embedding.embed_documents(batch_to_embed[mid:])
+                else:
+                    embs = embedding.embed_documents(batch_to_embed)
+
+                for h, emb in zip(cache_hits, embs):
+                    cache[h] = emb
+                    new_cache_entries[h] = emb
+                embeddings.extend(embs)
+
+        if new_cache_entries:
+            json.dump(cache, open(cache_file, "w", encoding="utf-8"))
+
+        dim = len(embeddings[0])
+        index = faiss.IndexFlatL2(dim)
+        if faiss.get_num_gpus() > 0:
+            print("Using FAISS GPU acceleration...")
+            index = faiss.index_cpu_to_all_gpus(index)
+        index.add(np.array(embeddings).astype("float32"))
+
+        faiss_db = FAISS(embedding=embedding, index=index, documents=[
+            Document(page_content=t, metadata=m) for t, m in zip(texts, metadatas)
+        ])
+        faiss_db.save_local(index_path)
+
+    bm25_retriever = BM25Retriever.from_documents(chunks)
+    retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, faiss_db.as_retriever(search_type="similarity", search_kwargs={"k": k})],
+        weights=[0.5, 0.5]
     )
 
-    print(f"Retriever ready in {time.time() - start_time:.2f} seconds")
+    print(f"Hybrid Retriever ready in {time.time() - start_time:.2f} seconds")
     return retriever
 
 
-# LLM QA 체인 생성
+def enrich_documents_with_metadata(docs):
+    enriched = []
+    for doc in docs:
+        meta = doc.metadata
+        meta_text = (
+            f"[메타데이터]\n"
+            f"- 사업명: {meta.get('사업명', '')}\n"
+            f"- 공고번호: {meta.get('공고번호', '')}\n"
+            f"- 공고차수: {meta.get('공고차수', '')}\n"
+            f"- 사업금액: {meta.get('사업금액', '')}\n"
+            f"- 발주기관: {meta.get('발주기관', '')}\n"
+            f"- 입찰참여시작일: {meta.get('입찰참여시작일', '')}\n"
+            f"- 입찰참여마감일: {meta.get('입찰참여마감일', '')}\n"
+            f"- 사업요약: {meta.get('사업요약', '')}\n"
+            f"- 파일명: {meta.get('파일명', '')}\n"
+        )
+        enriched.append(meta_text + "\n" + doc.page_content)
+    return "\n\n".join(enriched)
+
+
 def build_chain(retriever):
     llm = ChatOpenAI(model="gpt-4o", temperature=0.3)
-
     prompt = PromptTemplate.from_template(
-        """쿼리 입력 : 
+        """당신은 정부 사업 공고서를 요약해주는 비서입니다.
+
 문맥:
 {context}
 
-질문:
+사용자의 질문:
 {question}
 
 답변:"""
     )
 
-    chain = (
-        {"context": retriever, "question": RunnablePassthrough()}
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
+    def full_chain_fn(question):
+        docs = retriever.invoke(question)
+        context = enrich_documents_with_metadata(docs)
+        return prompt.format(context=context, question=question)
+
+    chain = RunnablePassthrough() | full_chain_fn | llm | StrOutputParser()
     return chain
 
 
-
-# 예시 실행
 if __name__ == "__main__":
-
-    retriever = get_retriever("/home/data/data/", reuse_index=True, limit_files=None) # 리트리버 로드
-    chain = build_chain(retriever) # LLM QA 체인 생성 
-
-    #쿼리 입력 파트
+    retriever = get_retriever("/home/data/data/",
+                               reuse_index=True, limit_files=None)
+    chain = build_chain(retriever)
     while True:
-        query = input("\n 질문을 입력하세요 (exit 입력 시 종료): ") 
+        query = input("\n 질문을 입력하세요 (exit 입력 시 종료): ")
         if query.lower() == "exit":
             break
         result = chain.invoke(query)
         print("\n답변:")
-        print(result)  
+        print(result)
